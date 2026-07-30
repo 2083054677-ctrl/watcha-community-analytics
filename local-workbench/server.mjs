@@ -80,35 +80,36 @@ function metricSnapshot(result, checkedAt, elapsedMinutes) {
   };
 }
 
-async function collectTaskWindow(task, endDate, elapsedMinutes) {
+async function collectTaskWindow(task, endDate, elapsedMinutes, sinceRaw = task.since) {
   const result = await queryClickHouse({
     code: "",
     pathNames: getTaskPaths(task),
     campaign: "",
-    sinceRaw: task.since,
+    sinceRaw,
     endRaw: endDate.toISOString(),
   });
   return metricSnapshot(result, new Date().toISOString(), elapsedMinutes);
 }
 
-async function runScheduledCollection() {
+async function runScheduledCollection(includeCurrent = false) {
   if (collectionRunning) return;
   collectionRunning = true;
   try {
     const state = readDashboardState();
     let changed = false;
     for (const task of state.tasks) {
-      if (task.collectionStatus === "completed" && task.milestones?.t2) continue;
       const sharedAt = new Date(task.since);
       const paths = getTaskPaths(task);
       if (Number.isNaN(sharedAt.getTime()) || !paths.length || sharedAt.getTime() > Date.now()) continue;
+      if (task.collectionStatus === "completed" && task.milestones?.t4 && !includeCurrent) continue;
       const elapsedMinutes = Math.max(0, Math.floor((Date.now() - sharedAt.getTime()) / 60000));
-      task.collectionStatus = elapsedMinutes >= 120 ? "collecting" : "collecting";
+      task.duration = "4";
+      task.collectionStatus = "collecting";
       task.collectionLastAttempt = new Date().toISOString();
       task.autoSamples = Array.isArray(task.autoSamples) ? task.autoSamples : [];
       task.milestones = task.milestones && typeof task.milestones === "object" ? task.milestones : {};
       try {
-        const cappedMinutes = Math.min(120, elapsedMinutes);
+        const cappedMinutes = Math.min(240, elapsedMinutes);
         const liveEnd = new Date(sharedAt.getTime() + cappedMinutes * 60000);
         const snapshot = await collectTaskWindow(task, liveEnd, cappedMinutes);
         task.autoSamples.push(snapshot);
@@ -130,7 +131,18 @@ async function runScheduledCollection() {
         if (elapsedMinutes >= 120 && !task.milestones.t2) {
           task.milestones.t2 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 7200000), 120);
         }
-        task.collectionStatus = elapsedMinutes >= 120 ? "completed" : "collecting";
+        if (elapsedMinutes >= 240 && !task.milestones.t4) {
+          task.milestones.t4 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 14400000), 240);
+        }
+        if (includeCurrent) {
+          task.currentSnapshot = await collectTaskWindow(
+            task,
+            new Date(),
+            elapsedMinutes,
+            task.statsSince || task.since,
+          );
+        }
+        task.collectionStatus = elapsedMinutes >= 240 ? "completed" : "collecting";
         task.collectionError = "";
         task.collectionUpdatedAt = new Date().toISOString();
       } catch (error) {
@@ -364,6 +376,7 @@ const server = http.createServer(async (req, res) => {
           collectionError: task.collectionError,
           collectionLastAttempt: task.collectionLastAttempt,
           collectionUpdatedAt: task.collectionUpdatedAt,
+          currentSnapshot: task.currentSnapshot,
         }]));
         incoming.tasks = Array.isArray(incoming.tasks) ? incoming.tasks.map((task) => ({
           ...task,
@@ -375,7 +388,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (url.pathname === "/api/collect" && req.method === "POST") {
-      await runScheduledCollection();
+      await runScheduledCollection(true);
       return sendJson(res, 200, { ok: true, checkedAt: new Date().toISOString() });
     }
     if (url.pathname === "/api/metrics") {
