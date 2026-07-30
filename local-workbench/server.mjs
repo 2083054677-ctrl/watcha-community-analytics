@@ -8,6 +8,8 @@ import pg from "pg";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.dirname(here);
 const port = 4317;
+const dataDirectory = path.join(root, ".data");
+const dashboardStateFile = path.join(dataDirectory, "dashboard-state.json");
 let postgresPool;
 
 function readEnv() {
@@ -24,6 +26,30 @@ function readEnv() {
 function sendJson(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(JSON.stringify(data));
+}
+
+function readDashboardState() {
+  try {
+    const state = JSON.parse(fs.readFileSync(dashboardStateFile, "utf8"));
+    return {
+      tasks: Array.isArray(state.tasks) ? state.tasks : [],
+      profiles: Array.isArray(state.profiles) ? state.profiles : [],
+      updatedAt: state.updatedAt || null,
+    };
+  } catch {
+    return { tasks: [], profiles: [], updatedAt: null };
+  }
+}
+
+function writeDashboardState(payload) {
+  const tasks = Array.isArray(payload.tasks) ? payload.tasks.slice(0, 1000) : [];
+  const profiles = Array.isArray(payload.profiles) ? payload.profiles.slice(0, 500) : [];
+  const state = { tasks, profiles, updatedAt: new Date().toISOString() };
+  fs.mkdirSync(dataDirectory, { recursive: true });
+  const temporaryFile = `${dashboardStateFile}.tmp`;
+  fs.writeFileSync(temporaryFile, JSON.stringify(state, null, 2), { mode: 0o600 });
+  fs.renameSync(temporaryFile, dashboardStateFile);
+  return state;
 }
 
 async function readBody(req) {
@@ -231,6 +257,16 @@ ${JSON.stringify(payload)}`;
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname === "/api/state" && req.method === "GET") {
+      return sendJson(res, 200, readDashboardState());
+    }
+    if (url.pathname === "/api/state" && req.method === "PUT") {
+      try {
+        return sendJson(res, 200, writeDashboardState(await readBody(req)));
+      } catch {
+        return sendJson(res, 400, { error: "历史记录保存失败" });
+      }
+    }
     if (url.pathname === "/api/metrics") {
       const code = safeCode(url.searchParams.get("code"));
       const pathNames = url.searchParams.getAll("path").map(safePath).filter(Boolean);
