@@ -11,6 +11,7 @@ const port = 4317;
 const dataDirectory = path.join(root, ".data");
 const dashboardStateFile = path.join(dataDirectory, "dashboard-state.json");
 let postgresPool;
+let collectionRunning = false;
 
 function readEnv() {
   const result = {};
@@ -50,6 +51,98 @@ function writeDashboardState(payload) {
   fs.writeFileSync(temporaryFile, JSON.stringify(state, null, 2), { mode: 0o600 });
   fs.renameSync(temporaryFile, dashboardStateFile);
   return state;
+}
+
+function getTaskPaths(task) {
+  const urls = Array.isArray(task.urls) && task.urls.length ? task.urls : task.url ? [task.url] : [];
+  return [...new Set(urls.map((raw) => {
+    try { return safePath(new URL(raw).pathname); } catch { return ""; }
+  }).filter(Boolean))].slice(0, 20);
+}
+
+function metricSnapshot(result, checkedAt, elapsedMinutes) {
+  const row = result.totals || {};
+  return {
+    checkedAt,
+    elapsedMinutes,
+    visitors: Number(row.visitors) || 0,
+    visits: Number(row.visits) || 0,
+    pageviews: Number(row.pageviews) || 0,
+    loginUsers: Number(row.login_users) || 0,
+    loginEvents: Number(row.login_events) || 0,
+    registrations: Number(row.registrations) || 0,
+    breakdown: (result.breakdown || []).map((item) => ({
+      path: item.url_path,
+      visitors: Number(item.visitors) || 0,
+      visits: Number(item.visits) || 0,
+      pageviews: Number(item.pageviews) || 0,
+    })),
+  };
+}
+
+async function collectTaskWindow(task, endDate, elapsedMinutes) {
+  const result = await queryClickHouse({
+    code: "",
+    pathNames: getTaskPaths(task),
+    campaign: "",
+    sinceRaw: task.since,
+    endRaw: endDate.toISOString(),
+  });
+  return metricSnapshot(result, new Date().toISOString(), elapsedMinutes);
+}
+
+async function runScheduledCollection() {
+  if (collectionRunning) return;
+  collectionRunning = true;
+  try {
+    const state = readDashboardState();
+    let changed = false;
+    for (const task of state.tasks) {
+      if (task.collectionStatus === "completed" && task.milestones?.t2) continue;
+      const sharedAt = new Date(task.since);
+      const paths = getTaskPaths(task);
+      if (Number.isNaN(sharedAt.getTime()) || !paths.length || sharedAt.getTime() > Date.now()) continue;
+      const elapsedMinutes = Math.max(0, Math.floor((Date.now() - sharedAt.getTime()) / 60000));
+      task.collectionStatus = elapsedMinutes >= 120 ? "collecting" : "collecting";
+      task.collectionLastAttempt = new Date().toISOString();
+      task.autoSamples = Array.isArray(task.autoSamples) ? task.autoSamples : [];
+      task.milestones = task.milestones && typeof task.milestones === "object" ? task.milestones : {};
+      try {
+        const cappedMinutes = Math.min(120, elapsedMinutes);
+        const liveEnd = new Date(sharedAt.getTime() + cappedMinutes * 60000);
+        const snapshot = await collectTaskWindow(task, liveEnd, cappedMinutes);
+        task.autoSamples.push(snapshot);
+        task.autoSamples = task.autoSamples.slice(-30);
+        if (!task.milestones.t0) task.milestones.t0 = {
+          checkedAt: task.since,
+          elapsedMinutes: 0,
+          visitors: 0,
+          visits: 0,
+          pageviews: 0,
+          loginUsers: 0,
+          loginEvents: 0,
+          registrations: 0,
+          breakdown: [],
+        };
+        if (elapsedMinutes >= 60 && !task.milestones.t1) {
+          task.milestones.t1 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 3600000), 60);
+        }
+        if (elapsedMinutes >= 120 && !task.milestones.t2) {
+          task.milestones.t2 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 7200000), 120);
+        }
+        task.collectionStatus = elapsedMinutes >= 120 ? "completed" : "collecting";
+        task.collectionError = "";
+        task.collectionUpdatedAt = new Date().toISOString();
+      } catch (error) {
+        task.collectionStatus = "error";
+        task.collectionError = error instanceof Error ? error.message : "自动采集失败";
+      }
+      changed = true;
+    }
+    if (changed) writeDashboardState(state);
+  } finally {
+    collectionRunning = false;
+  }
 }
 
 async function readBody(req) {
@@ -262,10 +355,28 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/api/state" && req.method === "PUT") {
       try {
-        return sendJson(res, 200, writeDashboardState(await readBody(req)));
+        const incoming = await readBody(req);
+        const existing = readDashboardState();
+        const automaticById = new Map(existing.tasks.map((task) => [task.id, {
+          autoSamples: task.autoSamples,
+          milestones: task.milestones,
+          collectionStatus: task.collectionStatus,
+          collectionError: task.collectionError,
+          collectionLastAttempt: task.collectionLastAttempt,
+          collectionUpdatedAt: task.collectionUpdatedAt,
+        }]));
+        incoming.tasks = Array.isArray(incoming.tasks) ? incoming.tasks.map((task) => ({
+          ...task,
+          ...(automaticById.get(task.id) || {}),
+        })) : [];
+        return sendJson(res, 200, writeDashboardState(incoming));
       } catch {
         return sendJson(res, 400, { error: "历史记录保存失败" });
       }
+    }
+    if (url.pathname === "/api/collect" && req.method === "POST") {
+      await runScheduledCollection();
+      return sendJson(res, 200, { ok: true, checkedAt: new Date().toISOString() });
     }
     if (url.pathname === "/api/metrics") {
       const code = safeCode(url.searchParams.get("code"));
@@ -335,4 +446,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(port, "127.0.0.1", () => {
   console.log(`观猹社群数据工作台已启动：http://127.0.0.1:${port}`);
+  setTimeout(runScheduledCollection, 1500);
+  setInterval(runScheduledCollection, 5 * 60 * 1000);
 });
