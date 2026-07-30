@@ -139,7 +139,7 @@ async function runScheduledCollection(includeCurrent = false) {
             task,
             new Date(),
             elapsedMinutes,
-            task.statsSince || task.since,
+            task.since,
           );
         }
         task.collectionStatus = elapsedMinutes >= 240 ? "completed" : "collecting";
