@@ -56,7 +56,7 @@ function exportDashboardCsv(url) {
   const daysRaw = url.searchParams.get("days") || "1";
   const filter = url.searchParams.get("filter") || "all";
   const cutoff = daysRaw === "all" ? 0 : Date.now() - Math.max(1, Number(daysRaw) || 1) * 86400000;
-  const header = ["转发时间", "监控窗口", "一级分类", "内容类型", "社群画像", "社群类型", "用户画像", "转发群数", "预计覆盖人数", "链接", "链接访客", "链接会话", "链接浏览", "事件总访客", "事件总会话", "事件总浏览", "登录访客", "登录转化率", "完整文案", "运营备注"];
+  const header = ["转发时间", "转发形式", "监控窗口", "一级分类", "内容类型", "社群画像", "社群类型", "用户画像", "转发群数", "预计覆盖人数", "链接", "链接访客", "链接会话", "链接浏览", "链接跳出率", "链接平均访问时长（秒）", "事件总访客", "事件总会话", "事件总浏览", "登录访客", "登录转化率", "完整文案", "运营备注"];
   const rows = [header];
   for (const task of readDashboardState().tasks) {
     if (new Date(task.since).getTime() < cutoff || (filter !== "all" && task.sourceType !== filter)) continue;
@@ -69,6 +69,7 @@ function exportDashboardCsv(url) {
       const link = breakdown.get(urlPath) || {};
       rows.push([
         new Date(task.since).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }),
+        task.shareFormat || "文字 + 链接",
         `${hours}小时`,
         task.sourceType,
         task.category,
@@ -81,6 +82,8 @@ function exportDashboardCsv(url) {
         link.visitors || 0,
         link.visits || 0,
         link.pageviews || 0,
+        `${Number(link.bounceRate || 0).toFixed(1)}%`,
+        Number(link.averageVisitSeconds || 0).toFixed(1),
         snapshot.visitors || 0,
         snapshot.visits || 0,
         snapshot.pageviews || 0,
@@ -136,11 +139,15 @@ function metricSnapshot(result, checkedAt, elapsedMinutes) {
     loginUsers: Number(row.login_users) || 0,
     loginEvents: Number(row.login_events) || 0,
     registrations: Number(row.registrations) || 0,
+    bounceRate: Number(row.bounce_rate) || 0,
+    averageVisitSeconds: Number(row.average_visit_seconds) || 0,
     breakdown: (result.breakdown || []).map((item) => ({
       path: item.url_path,
       visitors: Number(item.visitors) || 0,
       visits: Number(item.visits) || 0,
       pageviews: Number(item.pageviews) || 0,
+      bounceRate: Number(item.bounce_rate) || 0,
+      averageVisitSeconds: Number(item.average_visit_seconds) || 0,
     })),
   };
 }
@@ -190,16 +197,16 @@ async function runScheduledCollection(includeCurrent = false) {
           registrations: 0,
           breakdown: [],
         };
-        if (elapsedMinutes >= 60 && !task.milestones.t1) {
+        if (elapsedMinutes >= 60 && (!task.milestones.t1 || !Number.isFinite(task.milestones.t1.bounceRate))) {
           task.milestones.t1 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 3600000), 60);
         }
-        if (elapsedMinutes >= 120 && !task.milestones.t2) {
+        if (elapsedMinutes >= 120 && (!task.milestones.t2 || !Number.isFinite(task.milestones.t2.bounceRate))) {
           task.milestones.t2 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 7200000), 120);
         }
-        if (elapsedMinutes >= 180 && !task.milestones.t3) {
+        if (elapsedMinutes >= 180 && (!task.milestones.t3 || !Number.isFinite(task.milestones.t3.bounceRate))) {
           task.milestones.t3 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 10800000), 180);
         }
-        if (elapsedMinutes >= 240 && !task.milestones.t4) {
+        if (elapsedMinutes >= 240 && (!task.milestones.t4 || !Number.isFinite(task.milestones.t4.bounceRate))) {
           task.milestones.t4 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 14400000), 240);
         }
         if (includeCurrent) {
@@ -316,29 +323,45 @@ async function queryClickHouse({ code, pathNames, campaign, sinceRaw, endRaw }) 
     : `url_path IN (${pathSql})`;
   const query = `
 WITH attributed_visits AS (
-  SELECT visit_id, any(session_id) AS visitor_id, min(created_at) AS first_hit
+  SELECT website_id, visit_id, any(session_id) AS visitor_id, min(created_at) AS first_hit
   FROM website_event
   WHERE created_at >= toDateTime('${since}', 'UTC')
     AND created_at < toDateTime('${end}', 'UTC')
+    AND hostname = 'watcha.cn'
+    AND event_type = 1
     AND empty(event_name)
     AND ${attribution}
-  GROUP BY visit_id
+  GROUP BY website_id, visit_id
 ),
 journey AS (
-  SELECT a.visit_id, a.visitor_id, w.event_name, w.url_path, w.event_type
+  SELECT a.visit_id, a.visitor_id, w.event_name, w.url_path, w.event_type, w.created_at
   FROM attributed_visits a
-  INNER JOIN website_event w ON w.visit_id = a.visit_id
+  INNER JOIN website_event w ON w.website_id = a.website_id AND w.visit_id = a.visit_id
   WHERE w.created_at >= a.first_hit
     AND w.created_at < toDateTime('${end}', 'UTC')
+),
+visit_metrics AS (
+  SELECT
+    visit_id,
+    any(visitor_id) AS visitor_id,
+    countIf(event_type = 1) AS all_pageviews,
+    countIf(event_type = 1 AND empty(event_name) AND url_path IN (${pathSql})) AS monitored_pageviews,
+    countIf(event_name IN ('auth.login','auth.3rd.wechat.login')) AS visit_login_events,
+    countIf(event_name = 'auth.register') AS visit_registrations,
+    dateDiff('second', min(created_at), max(created_at)) AS duration_seconds
+  FROM journey
+  GROUP BY visit_id
 )
 SELECT
   uniqExact(visitor_id) AS visitors,
   uniqExact(visit_id) AS visits,
-  countIf(empty(event_name) AND url_path IN (${pathSql})) AS pageviews,
-  uniqExactIf(visitor_id, event_name IN ('auth.login','auth.3rd.wechat.login')) AS login_users,
-  countIf(event_name IN ('auth.login','auth.3rd.wechat.login')) AS login_events,
-  countIf(event_name = 'auth.register') AS registrations
-FROM journey
+  sum(monitored_pageviews) AS pageviews,
+  uniqExactIf(visitor_id, visit_login_events > 0) AS login_users,
+  sum(visit_login_events) AS login_events,
+  sum(visit_registrations) AS registrations,
+  round(100 * countIf(all_pageviews = 1) / greatest(count(), 1), 1) AS bounce_rate,
+  round(avg(duration_seconds), 1) AS average_visit_seconds
+FROM visit_metrics
 FORMAT JSONEachRow`;
   const endpoint = `${env.CLICKHOUSE_HOST}/?database=${encodeURIComponent(env.CLICKHOUSE_DATABASE || "umami")}&compress=0`;
   const text = await curlWithInput([
@@ -349,19 +372,48 @@ FORMAT JSONEachRow`;
     "--data-binary", "@-",
     endpoint,
   ], query);
+  if (text.trim().startsWith("Code:")) throw new Error(text.trim());
   const totals = text.trim() ? JSON.parse(text.trim().split("\n")[0]) : {};
   const breakdownQuery = `
+WITH path_visits AS (
+  SELECT
+    website_id,
+    url_path,
+    visit_id,
+    any(session_id) AS visitor_id,
+    min(created_at) AS first_hit,
+    count() AS path_pageviews
+  FROM website_event
+  WHERE created_at >= toDateTime('${since}', 'UTC')
+    AND created_at < toDateTime('${end}', 'UTC')
+    AND hostname = 'watcha.cn'
+    AND empty(event_name)
+    AND event_type = 1
+    AND url_path IN (${pathSql})
+  GROUP BY website_id, url_path, visit_id
+),
+path_visit_metrics AS (
+  SELECT
+    p.url_path,
+    p.visit_id,
+    any(p.visitor_id) AS visitor_id,
+    any(p.path_pageviews) AS path_pageviews,
+    countIf(w.event_type = 1) AS all_pageviews,
+    dateDiff('second', min(w.created_at), max(w.created_at)) AS duration_seconds
+  FROM path_visits p
+  INNER JOIN website_event w ON w.website_id = p.website_id AND w.visit_id = p.visit_id
+  WHERE w.created_at >= p.first_hit
+    AND w.created_at < toDateTime('${end}', 'UTC')
+  GROUP BY p.url_path, p.visit_id
+)
 SELECT
   url_path,
-  uniqExact(session_id) AS visitors,
+  uniqExact(visitor_id) AS visitors,
   uniqExact(visit_id) AS visits,
-  count() AS pageviews
-FROM website_event
-WHERE created_at >= toDateTime('${since}', 'UTC')
-  AND created_at < toDateTime('${end}', 'UTC')
-  AND empty(event_name)
-  AND event_type = 1
-  AND url_path IN (${pathSql})
+  sum(path_pageviews) AS pageviews,
+  round(100 * countIf(all_pageviews = 1) / greatest(count(), 1), 1) AS bounce_rate,
+  round(avg(duration_seconds), 1) AS average_visit_seconds
+FROM path_visit_metrics
 GROUP BY url_path
 ORDER BY pageviews DESC
 FORMAT JSONEachRow`;
@@ -373,6 +425,7 @@ FORMAT JSONEachRow`;
     "--data-binary", "@-",
     endpoint,
   ], breakdownQuery);
+  if (breakdownText.trim().startsWith("Code:")) throw new Error(breakdownText.trim());
   return {
     totals,
     breakdown: breakdownText.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)),
@@ -483,6 +536,8 @@ const server = http.createServer(async (req, res) => {
             visitors: Number(item.visitors) || 0,
             visits: Number(item.visits) || 0,
             pageviews: Number(item.pageviews) || 0,
+            bounceRate: Number(item.bounce_rate) || 0,
+            averageVisitSeconds: Number(item.average_visit_seconds) || 0,
           })),
           campaign: campaign || "",
           since,
@@ -493,8 +548,11 @@ const server = http.createServer(async (req, res) => {
           loginUsers: Number(row.login_users) || 0,
           loginEvents: Number(row.login_events) || 0,
           registrations: Number(row.registrations) || 0,
+          bounceRate: Number(row.bounce_rate) || 0,
+          averageVisitSeconds: Number(row.average_visit_seconds) || 0,
         });
-      } catch {
+      } catch (error) {
+        console.error("ClickHouse metrics query failed:", error instanceof Error ? error.message : error);
         return sendJson(res, 503, { error: "数据库暂时不可用；请确认网络后等待自动重试" });
       }
     }
