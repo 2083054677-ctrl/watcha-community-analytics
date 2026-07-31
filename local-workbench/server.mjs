@@ -131,6 +131,7 @@ function getTaskPaths(task) {
 function metricSnapshot(result, checkedAt, elapsedMinutes) {
   const row = result.totals || {};
   return {
+    metricVersion: 2,
     checkedAt,
     elapsedMinutes,
     visitors: Number(row.visitors) || 0,
@@ -195,18 +196,19 @@ async function runScheduledCollection(includeCurrent = false) {
           loginUsers: 0,
           loginEvents: 0,
           registrations: 0,
+          metricVersion: 2,
           breakdown: [],
         };
-        if (elapsedMinutes >= 60 && (!task.milestones.t1 || !Number.isFinite(task.milestones.t1.bounceRate))) {
+        if (elapsedMinutes >= 60 && task.milestones.t1?.metricVersion !== 2) {
           task.milestones.t1 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 3600000), 60);
         }
-        if (elapsedMinutes >= 120 && (!task.milestones.t2 || !Number.isFinite(task.milestones.t2.bounceRate))) {
+        if (elapsedMinutes >= 120 && task.milestones.t2?.metricVersion !== 2) {
           task.milestones.t2 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 7200000), 120);
         }
-        if (elapsedMinutes >= 180 && (!task.milestones.t3 || !Number.isFinite(task.milestones.t3.bounceRate))) {
+        if (elapsedMinutes >= 180 && task.milestones.t3?.metricVersion !== 2) {
           task.milestones.t3 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 10800000), 180);
         }
-        if (elapsedMinutes >= 240 && (!task.milestones.t4 || !Number.isFinite(task.milestones.t4.bounceRate))) {
+        if (elapsedMinutes >= 240 && task.milestones.t4?.metricVersion !== 2) {
           task.milestones.t4 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 14400000), 240);
         }
         if (includeCurrent) {
@@ -348,7 +350,11 @@ visit_metrics AS (
     countIf(event_type = 1 AND empty(event_name) AND url_path IN (${pathSql})) AS monitored_pageviews,
     countIf(event_name IN ('auth.login','auth.3rd.wechat.login')) AS visit_login_events,
     countIf(event_name = 'auth.register') AS visit_registrations,
-    dateDiff('second', min(created_at), max(created_at)) AS duration_seconds
+    dateDiff(
+      'second',
+      minIf(created_at, event_type = 1 AND empty(event_name) AND url_path IN (${pathSql})),
+      maxIf(created_at, event_type = 1 AND empty(event_name) AND url_path IN (${pathSql}))
+    ) AS duration_seconds
   FROM journey
   GROUP BY visit_id
 )
@@ -359,7 +365,7 @@ SELECT
   uniqExactIf(visitor_id, visit_login_events > 0) AS login_users,
   sum(visit_login_events) AS login_events,
   sum(visit_registrations) AS registrations,
-  round(100 * countIf(all_pageviews = 1) / greatest(count(), 1), 1) AS bounce_rate,
+  round(100 * countIf(monitored_pageviews = 1) / greatest(count(), 1), 1) AS bounce_rate,
   round(avg(duration_seconds), 1) AS average_visit_seconds
 FROM visit_metrics
 FORMAT JSONEachRow`;
@@ -382,7 +388,8 @@ WITH path_visits AS (
     visit_id,
     any(session_id) AS visitor_id,
     min(created_at) AS first_hit,
-    count() AS path_pageviews
+    count() AS path_pageviews,
+    dateDiff('second', min(created_at), max(created_at)) AS duration_seconds
   FROM website_event
   WHERE created_at >= toDateTime('${since}', 'UTC')
     AND created_at < toDateTime('${end}', 'UTC')
@@ -398,12 +405,8 @@ path_visit_metrics AS (
     p.visit_id,
     any(p.visitor_id) AS visitor_id,
     any(p.path_pageviews) AS path_pageviews,
-    countIf(w.event_type = 1) AS all_pageviews,
-    dateDiff('second', min(w.created_at), max(w.created_at)) AS duration_seconds
+    any(p.duration_seconds) AS duration_seconds
   FROM path_visits p
-  INNER JOIN website_event w ON w.website_id = p.website_id AND w.visit_id = p.visit_id
-  WHERE w.created_at >= p.first_hit
-    AND w.created_at < toDateTime('${end}', 'UTC')
   GROUP BY p.url_path, p.visit_id
 )
 SELECT
@@ -411,7 +414,7 @@ SELECT
   uniqExact(visitor_id) AS visitors,
   uniqExact(visit_id) AS visits,
   sum(path_pageviews) AS pageviews,
-  round(100 * countIf(all_pageviews = 1) / greatest(count(), 1), 1) AS bounce_rate,
+  round(100 * countIf(path_pageviews = 1) / greatest(count(), 1), 1) AS bounce_rate,
   round(avg(duration_seconds), 1) AS average_visit_seconds
 FROM path_visit_metrics
 GROUP BY url_path
