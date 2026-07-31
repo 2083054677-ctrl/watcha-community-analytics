@@ -29,6 +29,71 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+function csvCell(value) {
+  return `"${String(value ?? "").replaceAll("\"", "\"\"")}"`;
+}
+
+function sendCsv(res, csv, filename) {
+  res.writeHead(200, {
+    "Content-Type": "text/csv; charset=utf-8",
+    "Content-Disposition": `attachment; filename="community-export.csv"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    "Cache-Control": "no-store",
+  });
+  res.end(`\ufeff${csv}`);
+}
+
+function snapshotAtHour(task, hours) {
+  const exact = task.milestones?.[`t${hours}`];
+  if (exact) return exact;
+  const limit = hours * 60;
+  return [...(task.autoSamples || []), ...(task.samples || [])]
+    .filter((sample) => (sample.elapsedMinutes ?? limit) <= limit)
+    .at(-1) || {};
+}
+
+function exportDashboardCsv(url) {
+  const hours = Math.min(4, Math.max(1, Number(url.searchParams.get("hours")) || 4));
+  const daysRaw = url.searchParams.get("days") || "1";
+  const filter = url.searchParams.get("filter") || "all";
+  const cutoff = daysRaw === "all" ? 0 : Date.now() - Math.max(1, Number(daysRaw) || 1) * 86400000;
+  const header = ["转发时间", "监控窗口", "一级分类", "内容类型", "社群画像", "社群类型", "用户画像", "转发群数", "预计覆盖人数", "链接", "链接访客", "链接会话", "链接浏览", "事件总访客", "事件总会话", "事件总浏览", "登录访客", "登录转化率", "完整文案", "运营备注"];
+  const rows = [header];
+  for (const task of readDashboardState().tasks) {
+    if (new Date(task.since).getTime() < cutoff || (filter !== "all" && task.sourceType !== filter)) continue;
+    const snapshot = snapshotAtHour(task, hours);
+    const breakdown = new Map((snapshot.breakdown || []).map((item) => [item.path, item]));
+    const urls = Array.isArray(task.urls) && task.urls.length ? task.urls : task.url ? [task.url] : [];
+    for (const taskUrl of urls) {
+      let urlPath = "";
+      try { urlPath = new URL(taskUrl).pathname; } catch {}
+      const link = breakdown.get(urlPath) || {};
+      rows.push([
+        new Date(task.since).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }),
+        `${hours}小时`,
+        task.sourceType,
+        task.category,
+        (task.audienceNames || []).join("、"),
+        task.groupType,
+        task.audience,
+        task.groupCount || "",
+        task.estimatedReach || "",
+        taskUrl,
+        link.visitors || 0,
+        link.visits || 0,
+        link.pageviews || 0,
+        snapshot.visitors || 0,
+        snapshot.visits || 0,
+        snapshot.pageviews || 0,
+        snapshot.loginUsers || 0,
+        snapshot.visitors ? `${(snapshot.loginUsers / snapshot.visitors * 100).toFixed(1)}%` : "0%",
+        task.copy || "",
+        task.note || "",
+      ]);
+    }
+  }
+  return rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
+}
+
 function readDashboardState() {
   try {
     const state = JSON.parse(fs.readFileSync(dashboardStateFile, "utf8"));
@@ -130,6 +195,9 @@ async function runScheduledCollection(includeCurrent = false) {
         }
         if (elapsedMinutes >= 120 && !task.milestones.t2) {
           task.milestones.t2 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 7200000), 120);
+        }
+        if (elapsedMinutes >= 180 && !task.milestones.t3) {
+          task.milestones.t3 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 10800000), 180);
         }
         if (elapsedMinutes >= 240 && !task.milestones.t4) {
           task.milestones.t4 = await collectTaskWindow(task, new Date(sharedAt.getTime() + 14400000), 240);
@@ -364,6 +432,11 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (url.pathname === "/api/state" && req.method === "GET") {
       return sendJson(res, 200, readDashboardState());
+    }
+    if (url.pathname === "/api/export" && req.method === "GET") {
+      const hours = Math.min(4, Math.max(1, Number(url.searchParams.get("hours")) || 4));
+      const filename = `社群转发监控_${hours}h_${new Date().toISOString().slice(0, 10)}.csv`;
+      return sendCsv(res, exportDashboardCsv(url), filename);
     }
     if (url.pathname === "/api/state" && req.method === "PUT") {
       try {
